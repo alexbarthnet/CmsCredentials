@@ -375,7 +375,7 @@ Function Remove-CmsCredentialSecret {
 		Remove-Item -Path $cms_cert_old.FullName -Force
 	}
 
-	# retrieve old credential files
+	# retrieve credential files
 	$cms_files_old = Get-ChildItem -Path $cms_path | Where-Object { $_.BaseName -match $cms_file_regex -and $_.BaseName -notlike $ExceptFile } | Sort-Object -Property 'Name'
 	ForEach ($cms_file_old in $cms_files_old) {
 		Write-Host "Removing CMS credential: '$($cms_file_old.FullName)'"
@@ -967,19 +967,19 @@ Function Revoke-CmsCredentialAccess {
 	None.
 
 	.EXAMPLE
-	PS> Revoke-CmsCredentialAccess -Target "testcredential" -Principals "DOMAIN\TestUser"
+	PS> Revoke-CmsCredentialAccess -Target "testcredential" -Principals "DOMAIN\User1","DOMAIN\User2"
 
 	.EXAMPLE
-	PS> Revoke-CmsCredentialAccess -Target "testcredential" -Principals "DOMAIN\TestUser" -ComputerName "server1", "server2"
+	PS> Revoke-CmsCredentialAccess -Target "testcredential" -Principals "DOMAIN\GroupA" -ComputerName "server1", "server2"
 
 	.EXAMPLE
-	PS> Revoke-CmsCredentialAccess -Target "testcredential" -Principals "DOMAIN\TestUser" -ClusterName "cluster1", "cluster2"
+	PS> Revoke-CmsCredentialAccess -Target "testcredential" -Principals "DOMAIN\User1","DOMAIN\GroupA" -ClusterName "cluster1", "cluster2"
 
 	.EXAMPLE
-	PS> Revoke-CmsCredentialAccess -Target "testcredential" -Principals "DOMAIN\TestUser" -Cluster
+	PS> Revoke-CmsCredentialAccess -Target "testcredential" -Principals "DOMAIN\User1" -Cluster
 
 	.EXAMPLE
-	PS> Revoke-CmsCredentialAccess -Target "testcredential" -Principals "DOMAIN\TestUser" -ComputerName "server1", "server2" -ClusterName "cluster1", "cluster2" -Cluster
+	PS> Revoke-CmsCredentialAccess -Target "testcredential" -Principals "DOMAIN\GroupA","DOMAIN\User2" -ComputerName "server1", "server2" -ClusterName "cluster1", "cluster2" -Cluster
 
 	#>
 
