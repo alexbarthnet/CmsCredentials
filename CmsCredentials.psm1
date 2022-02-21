@@ -175,9 +175,6 @@ Function Protect-CmsCredentialSecret {
 	.PARAMETER Prefix
 	Specifies the prefix for the CMS credential file. Set to 'cms' by default.
 
-	.PARAMETER Hostname
-	Specifies the hostname in the CMS credential. Set to the local hostname by default.
-
 	.PARAMETER Reset
 	Specifies that a new CMS certificate is required.
 
@@ -200,20 +197,31 @@ Function Protect-CmsCredentialSecret {
 		[Parameter(Position = 3)]
 		[string]$Prefix = 'cms',
 		[Parameter(Position = 4)]
-		[string]$Hostname = [System.Environment]::MachineName,
-		[Parameter(Position = 5)]
-		[bool]$Reset
+		[bool]$Reset,
+		[Parameter(DontShow)]
+		[string]$Date = { Get-Date -Format 'FileDateTimeUniversal' },
+		[Parameter(DontShow)]
+		[string]$Hostname = [System.Environment]::MachineName.ToLowerInvariant(),
+		[Parameter(DontShow)]
+		[string]$Path = [System.Environment]::GetFolderPath('CommonApplicationData')
 	)
 
 	# define required objects
 	$cms_cert = $null
 	$cms_make = $false
-	$cms_date = Get-Date -Format FileDateTimeUniversal
 
 	# verify cms folder
-	$cms_root = [System.Environment]::GetFolderPath('CommonApplicationData')
-	$cms_path = Join-Path -Path $cms_root -ChildPath ($Prefix, $Hostname -join '_')
-	If (!(Test-Path -Path $cms_path)) { New-Item -ItemType Directory -Path $cms_path | Out-Null }
+	$cms_path = Join-Path -Path $Path -ChildPath ($Prefix, $Hostname -join '_')
+	If (!(Test-Path -Path $cms_path)) { 
+		Try {
+			$null = New-Item -ItemType 'Directory' -Path $cms_path
+		}
+		Catch {
+			Write-Host 'ERROR: could not create CMS folder'
+			Return
+		}
+		
+	}
 
 	# check if a new certificate should be made regardless of current certs
 	If ($Reset) {
@@ -253,7 +261,7 @@ Function Protect-CmsCredentialSecret {
 	# create the certificate
 	If ($cms_make) {
 		# define certificate subject
-		$cms_subject = "CN=$($Hostname, $Target, $cms_date -join '-')"
+		$cms_subject = "CN=$($Hostname, $Target, $Date -join '-')"
 
 		# create temporary files
 		$cert_inf = New-TemporaryFile
@@ -265,7 +273,7 @@ Function Protect-CmsCredentialSecret {
 
 		# create certificate
 		Try {
-			certreq.exe -new -f -q $cert_inf $cert_cer | Out-Null
+			$null = Invoke-Expression -Command "certreq.exe -new -f -q $cert_inf $cert_cer"
 		}
 		Catch {
 			# figure out what to put here!
@@ -284,15 +292,15 @@ Function Protect-CmsCredentialSecret {
 		Else {
 			# declare error and exit
 			Write-Host "ERROR: could not create CMS certificate: '$($cms_subject)'"
+			Return
 		}
 	}
 
 	# if a CMS cert exists...
 	If ($cms_cert) {
 		# define required strings
-		$cms_name = ($Prefix, $Hostname, $Target, $cms_date) -join '_'
+		$cms_name = ($Prefix, $Hostname, $Target, $Date) -join '_'
 		$cms_file = Join-Path -Path $cms_path -ChildPath "$cms_name.txt"
-		$cms_file_regex = ($Prefix, $Hostname, $Target, '-\d{8}') -join '_'
 
 		# create custom object for export
 		$cms_cred = $null
@@ -304,34 +312,16 @@ Function Protect-CmsCredentialSecret {
 		# encrypt credentials to local certificate
 		Try {
 			$cms_cred | ConvertTo-Json | Protect-CmsMessage -To $cms_cert.Thumbprint -OutFile $cms_file
-			$cms_made = $true
 			Write-Host "CMS file created: '$($cms_file)'"
 		}
 		Catch {
-			$cms_made = $false
 			Write-Host 'ERROR: could not encrypt the CMS file'
+			Return
 		}
 
-		# if CMS was made, clean up files and certificates
-		If ($cms_made) {
-			# retrieve old certificates files
-			$cms_cert_old = Get-ChildItem -Path 'Cert:\LocalMachine\My' -DocumentEncryptionCert | Where-Object { $_.Subject -match $cms_cert_regex } | Sort-Object -Property 'Subject' | Select-Object -SkipLast 1
-
-			# remove old certificates files
-			$cms_cert_old | ForEach-Object {
-				Write-Host "Removing old CMS certificate: '$($_.Subject)'"
-				$_ | Remove-Item -Force
-			}
-
-			# retrieve old credential files
-			$cms_file_old = Get-ChildItem -Path $cms_path | Where-Object { $_.BaseName -match $cms_file_regex } | Sort-Object -Property 'Name' | Select-Object -SkipLast 1
-
-			# remove old credential files
-			$cms_file_old | ForEach-Object {
-				Write-Host "Removing old CMS credential: '$($_.FullName)'"
-				$_ | Remove-Item -Force
-			}
-		}
+		# declare clean up
+		Write-Host 'Removing old CMS files...'
+		Remove-CmsCredentialSecret -Target $Target -Prefix $Prefix -ExceptCert $cms_cert.Subject -ExceptFile $cms_name
 	}
 }
 
@@ -349,9 +339,6 @@ Function Remove-CmsCredentialSecret {
 	.PARAMETER Prefix
 	Specifies the prefix for the CMS credential file. Set to 'cms' by default.
 
-	.PARAMETER Hostname
-	Specifies the hostname in the CMS credential. Set to the local hostname by default.
-
 	.INPUTS
 	None.
 
@@ -367,27 +354,32 @@ Function Remove-CmsCredentialSecret {
 		[Parameter(Position = 1)]
 		[string]$Prefix = 'cms',
 		[Parameter(Position = 2)]
-		[string]$Hostname = [System.Environment]::MachineName
+		[string]$ExceptCert = '',
+		[Parameter(Position = 3)]
+		[string]$ExceptFile = '',
+		[Parameter(DontShow)]
+		[string]$Hostname = [System.Environment]::MachineName.ToLowerInvariant(),
+		[Parameter(DontShow)]
+		[string]$Path = [System.Environment]::GetFolderPath('CommonApplicationData')
 	)
 
 	# define strings
-	$cms_root = [System.Environment]::GetFolderPath('CommonApplicationData')
-	$cms_path = Join-Path -Path $cms_root -ChildPath ($Prefix, $Hostname -join '_')
+	$cms_path = Join-Path -Path $Path -ChildPath ($Prefix, $Hostname -join '_')
 	$cms_cert_regex = ("CN=$Hostname", $Target, '\d{8}') -join '-'
-	$cms_file_regex = ($Prefix, $Hostname, $Target, '-\d{8}') -join '_'
+	$cms_file_regex = ($Prefix, $Hostname, $Target, '\d{8}') -join '_'
 
 	# remove certificates
-	$cms_cert_old = Get-ChildItem -Path 'Cert:\LocalMachine\My' -DocumentEncryptionCert | Where-Object { $_.Subject -match $cms_cert_regex }
-	$cms_cert_old | ForEach-Object {
-		Write-Host "Removing CMS certificate: '$($_.Subject)'"
-		$_ | Remove-Item -Force
+	$cms_certs_old = Get-ChildItem -Path 'Cert:\LocalMachine\My' -DocumentEncryptionCert | Where-Object { $_.Subject -match $cms_cert_regex -and $_.Subject -notlike $ExceptCert} | Sort-Object -Property 'Subject'
+	ForEach ($cms_cert_old in $cms_certs_old) {
+		Write-Host "Removing CMS certificate: '$($cms_cert_old.Subject)'"
+		Remove-Item -Path $cms_cert_old.FullName -Force
 	}
 
-	# remove credential files
-	$cms_file_old = Get-ChildItem -Path $cms_path | Where-Object { $_.BaseName -match $cms_file_regex }
-	$cms_file_old | ForEach-Object {
-		Write-Host "Removing CMS credential: '$($_.FullName)'"
-		$_ | Remove-Item -Force
+	# retrieve old credential files
+	$cms_files_old = Get-ChildItem -Path $cms_path | Where-Object { $_.BaseName -match $cms_file_regex -and $_.BaseName -notlike $ExceptFile } | Sort-Object -Property 'Name'
+	ForEach ($cms_file_old in $cms_files_old) {
+		Write-Host "Removing CMS credential: '$($cms_file_old.FullName)'"
+		Remove-Item -Path $cms_file_old.FullName -Force
 	}
 }
 
@@ -423,11 +415,18 @@ Function Update-CmsCredentialAccess {
 		[Parameter(Position = 1)]
 		[string]$Target,
 		[Parameter(Position = 2)]
-		[string[]]$Principals
+		[string[]]$Principals,
+		[Parameter(DontShow)]
+		[string]$Hostname = [System.Environment]::MachineName.ToLowerInvariant(),
+		[Parameter(DontShow)]
+		[string]$Path = [System.Environment]::GetFolderPath('CommonApplicationData')
 	)
 
-	# create regex to match expected CMS certificate name of machinename followed by the target name then either a simple date or a FileDateTimeUniversal
-	$cms_regx = "CN=$([System.Environment]::MachineName)-$Target-\d{8}"
+	# define path string for local machine private keys
+	$cms_keys_path = Join-Path -Path $Path -ChildPath 'Microsoft\Crypto\RSA\MachineKeys'
+
+	# define regex string for CMS certificate name format: hostname then target then date where date is at least 8 characters
+	$cms_cert_regex = ("CN=$Hostname", $Target, '\d{8}') -join '-'
 
 	# retrieve SIDs for principals
 	$cms_sids = @()
@@ -450,12 +449,12 @@ Function Update-CmsCredentialAccess {
 
 	# check local machine store for existing certificate
 	$cms_cert = $null
-	$cms_cert = Get-ChildItem -Path 'Cert:\LocalMachine\My' -DocumentEncryptionCert | Where-Object { $_.Subject -match $cms_regx } | Sort-Object 'NotBefore' | Select-Object -Last 1
+	$cms_cert = Get-ChildItem -Path 'Cert:\LocalMachine\My' -DocumentEncryptionCert | Where-Object { $_.Subject -match $cms_cert_regex } | Sort-Object 'NotBefore' | Select-Object -Last 1
 	If ($cms_cert) {
 		# declare certificate subject
 		Write-Host "CMS certificate found, subject: '$($cms_cert.Subject)'"
 		# retrieve private key
-		$cms_key = Join-Path -Path 'C:\ProgramData\Microsoft\Crypto\RSA\MachineKeys' -ChildPath $cms_cert.PrivateKey.CspKeyContainerInfo.UniqueKeyContainerName
+		$cms_key = Join-Path -Path $cms_keys_path -ChildPath $cms_cert.PrivateKey.CspKeyContainerInfo.UniqueKeyContainerName
 		# retrieve private key permissions
 		$cms_acl = Get-Acl -Path $cms_key
 		# process SIDs
@@ -733,18 +732,20 @@ Function Unprotect-CmsCredentials {
 		[Parameter(Position = 1)]
 		[string]$Prefix = 'cms',
 		[Parameter(Position = 2)]
-		[switch]$PasswordOnly
+		[switch]$PasswordOnly,
+		[Parameter(Position = 3, DontShow)]
+		[string]$Hostname = [System.Environment]::MachineName.ToLowerInvariant(),
+		[Parameter(Position = 4, DontShow)]
+		[string]$Path = [System.Environment]::GetFolderPath('CommonApplicationData')
 	)
 
 	# define required strings
-	$cms_host = [System.Environment]::MachineName
-	$cms_root = [System.Environment]::GetFolderPath('CommonApplicationData')
-	$cms_path = Join-Path -Path $cms_root -ChildPath ($Prefix + '_' + $cms_host)
+	$cms_path = Join-Path -Path $Path -ChildPath ($Prefix + '_' + $Hostname)
 
 	# verify cms folder
 	If (Test-Path -Path $cms_path) {
 		# get cms file matching the host and target
-		$cms_file = Get-ChildItem -Path $cms_path | Where-Object { $_.BaseName -match $Target -and $_.BaseName -match $cms_host } | Sort-Object BaseName | Select-Object -Last 1
+		$cms_file = Get-ChildItem -Path $cms_path | Where-Object { $_.BaseName -match $Target -and $_.BaseName -match $Hostname } | Sort-Object BaseName | Select-Object -Last 1
 		If ($cms_file) {
 			# convert the encrypted file into an object
 			Try {
