@@ -23,71 +23,13 @@ ValidityPeriodUnits = "100"
 %szOID_ENHANCED_KEY_USAGE% = "{text}%szOID_DOCUMENT_ENCRYPTION%"
 "@
 
-Function ConvertTo-SecurityIdentifier {
-	<#
-	.SYNOPSIS
-	Converts an input into a security identifier.
-
-	.DESCRIPTION
-	Converts an input such as a Windows principal or a security identifier object into the string representation of security identifier.
-
-	.PARAMETER Principal
-	Specifies a Windows principal.
-
-	.INPUTS
-	String or System.Security.Principal.SecurityIdentifier
-
-	.OUTPUTS
-	String
-
-	#>
-
-	[CmdletBinding()]
-	param (
-		[Parameter(Position = 0, Mandatory = $true, ValueFromPipeline = $true)]
-		[object]$Principal
-	)
-
-	# verify the input
-	If ($Principal -isnot [System.String] -and $Principal -is [System.Security.Principal.SecurityIdentifier]) {
-		$Principal = $Principal.Value
-	}
-
-	# translate principal to SID
-	Try {
-		# check for specific well-known SIDs or translate the SID
-		switch ($Principal) {
-			# the Windows Authorization Access Group is a built-in SID that only resolves correctly on a domain controller
-			{ ($_ -eq 'Windows Authorization Access Group') -or ($_ -eq "$([System.Environment]::UserDomainName)\Windows Authorization Access Group") } {
-				Return [System.Security.Principal.SecurityIdentifier]('S-1-5-32-560')
-			}
-			# SID in string format
-			{ ($_ -match 'S-1-\d{1,2}-\d*') } {
-				Return [System.Security.Principal.SecurityIdentifier]($Principal)
-			}
-			# username in DOMAIN\USERNAME format
-			{ $_ -match '^[\w\.-]*\\[\w\.-]*$' } {
-				Return ([System.Security.Principal.NTAccount]($Principal)).Translate([System.Security.Principal.SecurityIdentifier])
-			}
-			# any other username
-			Default {
-				Return ([System.Security.Principal.NTAccount]([System.Environment]::UserDomainName, $Principal)).Translate([System.Security.Principal.SecurityIdentifier])
-			}
-		}
-	}
-	Catch {
-		# return error
-		Return $_
-	}
-}
-
-Function Get-CmsComputers {
+Function Get-ComputersFromParams {
 	<#
 	.SYNOPSIS
 	Creates a list of computers from inputs.
 
 	.DESCRIPTION
-	Creates a list of computers from inputs. Called by multiple functions in the CmsCredentials module.
+	Creates a list of computers from inputs. Called by multiple functions in this module.
 
 	.PARAMETER ComputerName
 	Specifies one or more remote computers.
@@ -117,7 +59,7 @@ Function Get-CmsComputers {
 	)
 
 	# define empty array
-	$CmsComputers = @()
+	$ComputersFromParams = @()
 
 	# retrieve local cluster name if requested
 	If ($Cluster) {
@@ -138,7 +80,7 @@ Function Get-CmsComputers {
 			Try {
 				$cluster_nodes = $null
 				$cluster_nodes = Invoke-Command -ComputerName $cluster_name -ScriptBlock { (Get-ClusterNode).Name }
-				$cluster_nodes | ForEach-Object { $CmsComputers += $_ }
+				$cluster_nodes | ForEach-Object { $ComputersFromParams += $_ }
 			}
 			Catch {
 				Write-Host "ERROR: could not retrieve list of cluster nodes from '$cluster_name'"
@@ -148,11 +90,11 @@ Function Get-CmsComputers {
 
 	# add computers to array from ComputerName argument
 	If ($ComputerName) {
-		$ComputerName | ForEach-Object { $CmsComputers += $_ }
+		$ComputerName | ForEach-Object { $ComputersFromParams += $_ }
 	}
 
 	# remove duplicate computers
-	$CmsComputers | Select-Object -Unique
+	$ComputersFromParams | Select-Object -Unique
 }
 
 Function Protect-CmsCredentialSecret {
@@ -172,11 +114,17 @@ Function Protect-CmsCredentialSecret {
 	.PARAMETER Template
 	Specifies the certificate template for the CMS certificate.
 
+	.PARAMETER Reset
+	Specifies that a new CMS certificate is required.
+
 	.PARAMETER Prefix
 	Specifies the prefix for the CMS credential file. Set to 'cms' by default.
 
-	.PARAMETER Reset
-	Specifies that a new CMS certificate is required.
+	.PARAMETER Hostname
+	Specifies the hostname in the CMS credential. Set to the local hostname by default.
+
+	.PARAMETER ParentPath
+	Specifies the parent path of the CMS credential folder. Set to the ProgramData folder by default.
 
 	.INPUTS
 	None.
@@ -195,33 +143,24 @@ Function Protect-CmsCredentialSecret {
 		[Parameter(Position = 2)]
 		[string]$Template,
 		[Parameter(Position = 3)]
-		[string]$Prefix = 'cms',
-		[Parameter(Position = 4)]
 		[bool]$Reset,
-		[Parameter(DontShow)]
-		[string]$Date = { Get-Date -Format 'FileDateTimeUniversal' },
-		[Parameter(DontShow)]
+		[Parameter(Position = 4)]
+		[string]$Prefix = 'cms',
+		[Parameter(Position = 5)]
 		[string]$Hostname = [System.Environment]::MachineName.ToLowerInvariant(),
-		[Parameter(DontShow)]
-		[string]$Path = [System.Environment]::GetFolderPath('CommonApplicationData')
+		[Parameter(Position = 6)][ValidateScript({Test-Path -Path $_})]
+		[string]$ParentPath = [System.Environment]::GetFolderPath('CommonApplicationData')
 	)
 
 	# define required objects
 	$cms_cert = $null
 	$cms_make = $false
+	$cms_date = Get-Date -Format FileDateTimeUniversal
+	$cms_path = Join-Path -Path $ParentPath -ChildPath ($Prefix, $Hostname -join '_')
 
 	# verify cms folder
-	$cms_path = Join-Path -Path $Path -ChildPath ($Prefix, $Hostname -join '_')
-	If (!(Test-Path -Path $cms_path)) { 
-		Try {
-			$null = New-Item -ItemType 'Directory' -Path $cms_path
-		}
-		Catch {
-			Write-Host 'ERROR: could not create CMS folder'
-			Return
-		}
-		
-	}
+	Write-Host "Checking CMS directory: $cms_path"
+	If (!(Test-Path -Path $cms_path)) { New-Item -ItemType Directory -Path $cms_path | Out-Null }
 
 	# check if a new certificate should be made regardless of current certs
 	If ($Reset) {
@@ -261,7 +200,7 @@ Function Protect-CmsCredentialSecret {
 	# create the certificate
 	If ($cms_make) {
 		# define certificate subject
-		$cms_subject = "CN=$($Hostname, $Target, $Date -join '-')"
+		$cms_subject = "CN=$($Hostname, $Target, $cms_date -join '-')"
 
 		# create temporary files
 		$cert_inf = New-TemporaryFile
@@ -273,7 +212,7 @@ Function Protect-CmsCredentialSecret {
 
 		# create certificate
 		Try {
-			$null = Invoke-Expression -Command "certreq.exe -new -f -q $cert_inf $cert_cer"
+			certreq.exe -new -f -q $cert_inf $cert_cer | Out-Null
 		}
 		Catch {
 			# figure out what to put here!
@@ -292,15 +231,15 @@ Function Protect-CmsCredentialSecret {
 		Else {
 			# declare error and exit
 			Write-Host "ERROR: could not create CMS certificate: '$($cms_subject)'"
-			Return
 		}
 	}
 
 	# if a CMS cert exists...
 	If ($cms_cert) {
 		# define required strings
-		$cms_name = ($Prefix, $Hostname, $Target, $Date) -join '_'
+		$cms_name = ($Prefix, $Hostname, $Target, $cms_date) -join '_'
 		$cms_file = Join-Path -Path $cms_path -ChildPath "$cms_name.txt"
+		$cms_file_regex = ($Prefix, $Hostname, $Target, '\d{8}') -join '_'
 
 		# create custom object for export
 		$cms_cred = $null
@@ -312,16 +251,36 @@ Function Protect-CmsCredentialSecret {
 		# encrypt credentials to local certificate
 		Try {
 			$cms_cred | ConvertTo-Json | Protect-CmsMessage -To $cms_cert.Thumbprint -OutFile $cms_file
+			$cms_made = $true
 			Write-Host "CMS file created: '$($cms_file)'"
 		}
 		Catch {
+			$cms_made = $false
 			Write-Host 'ERROR: could not encrypt the CMS file'
-			Return
 		}
 
-		# declare clean up
-		Write-Host 'Removing old CMS files...'
-		Remove-CmsCredentialSecret -Target $Target -Prefix $Prefix -ExceptCert $cms_cert.Subject -ExceptFile $cms_name
+		# if CMS was made, clean up files and certificates
+		If ($cms_made) {
+			# retrieve old certificates files
+			Write-Host "Checking for old CMS certificates: 'Cert:\LocalMachine\My'"
+			$cms_cert_old = Get-ChildItem -Path 'Cert:\LocalMachine\My' -DocumentEncryptionCert | Where-Object { $_.Subject -match $cms_cert_regex } | Sort-Object -Property 'NotBefore' | Select-Object -SkipLast 1
+
+			# remove old certificates files
+			$cms_cert_old | ForEach-Object {
+				Write-Host "...removing old CMS certificate: '$($_.Subject)'"
+				$_ | Remove-Item -Force
+			}
+
+			# retrieve old credential files
+			Write-Host "Checking for old CMS credentials: $cms_path"
+			$cms_file_old = Get-ChildItem -Path $cms_path | Where-Object { $_.BaseName -match $cms_file_regex } | Sort-Object -Property 'BaseName' | Select-Object -SkipLast 1
+
+			# remove old credential files
+			$cms_file_old | ForEach-Object {
+				Write-Host "...removing old CMS credential: '$($_.FullName)'"
+				$_ | Remove-Item -Force
+			}
+		}
 	}
 }
 
@@ -339,6 +298,12 @@ Function Remove-CmsCredentialSecret {
 	.PARAMETER Prefix
 	Specifies the prefix for the CMS credential file. Set to 'cms' by default.
 
+	.PARAMETER Hostname
+	Specifies the hostname in the CMS credential. Set to the local hostname by default.
+
+	.PARAMETER ParentPath
+	Specifies the parent path of the CMS credential folder. Set to the ProgramData folder by default.
+
 	.INPUTS
 	None.
 
@@ -354,32 +319,28 @@ Function Remove-CmsCredentialSecret {
 		[Parameter(Position = 1)]
 		[string]$Prefix = 'cms',
 		[Parameter(Position = 2)]
-		[string]$ExceptCert = '',
-		[Parameter(Position = 3)]
-		[string]$ExceptFile = '',
-		[Parameter(DontShow)]
 		[string]$Hostname = [System.Environment]::MachineName.ToLowerInvariant(),
-		[Parameter(DontShow)]
-		[string]$Path = [System.Environment]::GetFolderPath('CommonApplicationData')
+		[Parameter(Position = 3)][ValidateScript({Test-Path -Path $_})]
+		[string]$ParentPath = [System.Environment]::GetFolderPath('CommonApplicationData')
 	)
 
 	# define strings
-	$cms_path = Join-Path -Path $Path -ChildPath ($Prefix, $Hostname -join '_')
+	$cms_path = Join-Path -Path $ParentPath -ChildPath ($Prefix, $Hostname -join '_')
 	$cms_cert_regex = ("CN=$Hostname", $Target, '\d{8}') -join '-'
-	$cms_file_regex = ($Prefix, $Hostname, $Target, '\d{8}') -join '_'
+	$cms_file_regex = ($Prefix, $Hostname, $Target, '-\d{8}') -join '_'
 
 	# remove certificates
-	$cms_certs_old = Get-ChildItem -Path 'Cert:\LocalMachine\My' -DocumentEncryptionCert | Where-Object { $_.Subject -match $cms_cert_regex -and $_.Subject -notlike $ExceptCert} | Sort-Object -Property 'Subject'
-	ForEach ($cms_cert_old in $cms_certs_old) {
-		Write-Host "Removing CMS certificate: '$($cms_cert_old.Subject)'"
-		Remove-Item -Path $cms_cert_old.FullName -Force
+	$cms_cert_old = Get-ChildItem -Path 'Cert:\LocalMachine\My' -DocumentEncryptionCert | Where-Object { $_.Subject -match $cms_cert_regex }
+	$cms_cert_old | ForEach-Object {
+		Write-Host "Removing CMS certificate: '$($_.Subject)'"
+		$_ | Remove-Item -Force
 	}
 
-	# retrieve credential files
-	$cms_files_old = Get-ChildItem -Path $cms_path | Where-Object { $_.BaseName -match $cms_file_regex -and $_.BaseName -notlike $ExceptFile } | Sort-Object -Property 'Name'
-	ForEach ($cms_file_old in $cms_files_old) {
-		Write-Host "Removing CMS credential: '$($cms_file_old.FullName)'"
-		Remove-Item -Path $cms_file_old.FullName -Force
+	# remove credential files
+	$cms_file_old = Get-ChildItem -Path $cms_path | Where-Object { $_.BaseName -match $cms_file_regex }
+	$cms_file_old | ForEach-Object {
+		Write-Host "Removing CMS credential: '$($_.FullName)'"
+		$_ | Remove-Item -Force
 	}
 }
 
@@ -400,6 +361,9 @@ Function Update-CmsCredentialAccess {
 	.PARAMETER Principals
 	Specifies one or more Active Directory principals.
 
+	.PARAMETER Hostname
+	Specifies the hostname in the CMS credential. Set to the local hostname by default.
+
 	.INPUTS
 	None.
 
@@ -416,32 +380,50 @@ Function Update-CmsCredentialAccess {
 		[string]$Target,
 		[Parameter(Position = 2)]
 		[string[]]$Principals,
-		[Parameter(DontShow)]
-		[string]$Hostname = [System.Environment]::MachineName.ToLowerInvariant(),
-		[Parameter(DontShow)]
-		[string]$Path = [System.Environment]::GetFolderPath('CommonApplicationData')
+		[Parameter(Position = 3)]
+		[string]$Hostname = [System.Environment]::MachineName.ToLowerInvariant()
 	)
 
-	# define path string for local machine private keys
-	$cms_keys_path = Join-Path -Path $Path -ChildPath 'Microsoft\Crypto\RSA\MachineKeys'
-
-	# define regex string for CMS certificate name format: hostname then target then date where date is at least 8 characters
-	$cms_cert_regex = ("CN=$Hostname", $Target, '\d{8}') -join '-'
+	# create regex to match expected CMS certificate name of machinename followed by the target name then either a simple date or a FileDateTimeUniversal
+	$cms_regx = "CN=$Hostname-$Target-\d{8}"
 
 	# retrieve SIDs for principals
 	$cms_sids = @()
-	switch ($Mode) {
-		'Reset' {
-			$cms_sids += [System.Security.Principal.SecurityIdentifier]('S-1-5-18') # add NT AUTHORITY\SYSTEM
-			$cms_sids += [System.Security.Principal.SecurityIdentifier]('S-1-5-32-544') # add BUILTIN\Administrators
-		}
-		Default {
-			ForEach ($cms_principal in $Principals) {
+	If ($Mode -eq 'Reset') {
+		$cms_sids += [System.Security.Principal.SecurityIdentifier]('S-1-5-18') # add NT AUTHORITY\SYSTEM
+		$cms_sids += [System.Security.Principal.SecurityIdentifier]('S-1-5-32-544') # add BUILTIN\Administrators
+	}
+	Else {
+		ForEach ($cms_principal in $Principals) {
+			# verify the input
+			If ($cms_principal -isnot [System.String] -and $cms_principal -is [System.Security.Principal.SecurityIdentifier]) {
+				$cms_sids += $cms_principal
+			}
+			Else {
 				Try {
-					$cms_sids += ConvertTo-SecurityIdentifier -Principal $cms_principal
+					# check for specific well-known SIDs or translate the SID
+					switch ($cms_principal) {
+						# well-known built-in SID that only translates on a domain controller
+						{ ($_ -eq 'Windows Authorization Access Group') -or ($_ -eq "$([System.Environment]::UserDomainName)\Windows Authorization Access Group") } {
+							$cms_sids += [System.Security.Principal.SecurityIdentifier]('S-1-5-32-560')
+						}
+						# a SID in string format
+						{ ($_ -match 'S-1-\d{1,2}-\d+') } {
+							$cms_sids += [System.Security.Principal.SecurityIdentifier]($_)
+						}
+						# a principal with domain prefix or suffix
+						{ ($_ -match '^[\w\s\.-]+\\[\w\s\.-]+$') -or ($_ -match '^[\w\.-]+@[\w\.-]+$') } {
+							$cms_sids += ([System.Security.Principal.NTAccount]($_)).Translate([System.Security.Principal.SecurityIdentifier])
+						}
+						# any other username
+						Default {
+							$cms_sids += ([System.Security.Principal.NTAccount]("$([System.Environment]::UserDomainName)\$_")).Translate([System.Security.Principal.SecurityIdentifier])
+						}
+					}
 				}
 				Catch {
-					Write-Host "WARNING: unable to translate principal to SID: '$cms_principal'"
+					Write-Output "Could not translate principal to SID: '$cms_principal'"
+					Return
 				}
 			}
 		}
@@ -449,12 +431,12 @@ Function Update-CmsCredentialAccess {
 
 	# check local machine store for existing certificate
 	$cms_cert = $null
-	$cms_cert = Get-ChildItem -Path 'Cert:\LocalMachine\My' -DocumentEncryptionCert | Where-Object { $_.Subject -match $cms_cert_regex } | Sort-Object 'NotBefore' | Select-Object -Last 1
+	$cms_cert = Get-ChildItem -Path 'Cert:\LocalMachine\My' -DocumentEncryptionCert | Where-Object { $_.Subject -match $cms_regx } | Sort-Object 'NotBefore' | Select-Object -Last 1
 	If ($cms_cert) {
 		# declare certificate subject
 		Write-Host "CMS certificate found, subject: '$($cms_cert.Subject)'"
 		# retrieve private key
-		$cms_key = Join-Path -Path $cms_keys_path -ChildPath $cms_cert.PrivateKey.CspKeyContainerInfo.UniqueKeyContainerName
+		$cms_key = Join-Path -Path 'C:\ProgramData\Microsoft\Crypto\RSA\MachineKeys' -ChildPath $cms_cert.PrivateKey.CspKeyContainerInfo.UniqueKeyContainerName
 		# retrieve private key permissions
 		$cms_acl = Get-Acl -Path $cms_key
 		# process SIDs
@@ -499,11 +481,12 @@ Function Update-CmsCredentialAccess {
 			}
 		}
 		Catch {
-			$_
+			Return $_
 		}
 	}
 	Else {
-		Write-Error "CMS certificate not found: '$($cms_cert.Subject)'"
+		Write-Output "CMS certificate not found: '$($cms_cert.Subject)'"
+		Return
 	}
 }
 
@@ -524,8 +507,8 @@ Function Protect-CmsCredentials {
 	.PARAMETER Password
 	Specifies the password of a new credential to be protected with CMS.
 
-	.PARAMETER Template
-	Specifies the certificate template for the CMS certificate.
+	.PARAMETER TemplatePath
+	Specifies the path to the certificate template for the CMS certificate.
 
 	.PARAMETER Prefix
 	Specifies the prefix for the CMS credential file. Set to 'cms' by default.
@@ -561,7 +544,7 @@ Function Protect-CmsCredentials {
 		[Parameter(Position = 2, Mandatory = $True, ParameterSetName = 'Pass')]
 		[securestring]$Password,
 		[ValidateScript({ Test-Path -Path $_ })]
-		[string]$Template,
+		[string]$TemplatePath,
 		[string]$Prefix = 'cms',
 		[string[]]$ComputerName,
 		[string[]]$ClusterName,
@@ -570,30 +553,46 @@ Function Protect-CmsCredentials {
 	)
 
 	# check credentials
-	If ($null -ne $Cred) {
-		$cms_cred = $Cred
-	}
-	Else {
-		$cms_cred = New-Object System.Management.Automation.PSCredential -ArgumentList $Username, $Password
+	If ($null -eq $Cred) {
+		Try {
+			$Cred = New-Object System.Management.Automation.PSCredential -ArgumentList $Username, $Password
+		}
+		Catch {
+			Write-Host 'ERROR: could not create credential from username and password'
+			Return
+		}
 	}
 
 	# import template if requested
-	If ([string]::IsNullOrEmpty($Template)) {
-		$cms_template_text = $CmsTemplate
+	If ([string]::IsNullOrEmpty($TemplatePath)) {
+		$Template = $CmsTemplate
 	}
 	Else {
-		$cms_template_text = Get-Content -Path $Template
+		$Template = Get-Content -Path $TemplatePath
 	}
 
 	# get computer names
 	$CmsComputers = @()
-	$CmsComputers += Get-CmsComputers -Cluster:$Cluster -ClusterName $ClusterName -ComputerName $ComputerName
+	$CmsComputers += Get-ComputersFromParams -Cluster:$Cluster -ClusterName $ClusterName -ComputerName $ComputerName
+
+	# define parameter hashtable
+	$ProtectParameters = @{
+		Target   = $Target
+		Cred     = $Cred
+		Prefix   = $Prefix
+		Template = $Template
+		Reset    = $Reset
+	}
 
 	# encrypt credentials to certificate
 	If ($CmsComputers.Count -gt 0) {
+		$ProtectFunction = "function Protect-CmsCredentialSecret {${function:Protect-CmsCredentialSecret}}"
 		ForEach ($CmsComputer in $CmsComputers) {
 			Try {
-				Invoke-Command -ComputerName $CmsComputer -ScriptBlock ${function:Protect-CmsCredentialSecret} -ArgumentList $Target, $cms_cred, $Prefix, $cms_template_text, $Reset
+				Invoke-Command -ComputerName $CmsComputer -ScriptBlock {
+					. ([ScriptBlock]::Create($using:ProtectFunction))
+					Protect-CmsCredentialSecret @using:ProtectParameters
+				}
 			}
 			Catch {
 				Write-Host "ERROR: could not protect credentials on '$CmsComputer'"
@@ -601,7 +600,12 @@ Function Protect-CmsCredentials {
 		}
 	}
 	Else {
-		Protect-CmsCredentialSecret -Target $Target -Cred $cms_cred -Prefix $Prefix -Template $cms_template_text -Reset:$Reset
+		Try {
+			Protect-CmsCredentialSecret @ProtectParameters
+		}
+		Catch {
+			Write-Host 'ERROR: could not protect credentials on local computer'
+		}
 	}
 }
 
@@ -670,13 +674,23 @@ Function Remove-CmsCredentials {
 
 	# get computer names
 	$CmsComputers = @()
-	$CmsComputers += Get-CmsComputers -Cluster:$Cluster -ClusterName $ClusterName -ComputerName $ComputerName
+	$CmsComputers += Get-ComputersFromParams -Cluster:$Cluster -ClusterName $ClusterName -ComputerName $ComputerName
+
+	# define parameter hashtable
+	$RemoveParameters = @{
+		Target = $Target
+		Prefix = $Prefix
+	}
 
 	# encrypt credentials to certificate
 	If ($CmsComputers.Count -gt 0) {
 		ForEach ($CmsComputer in $CmsComputers) {
+			$RemoveFunction = "function Remove-CmsCredentialSecret {${function:Remove-CmsCredentialSecret}}"
 			Try {
-				Invoke-Command -ComputerName $CmsComputer -ScriptBlock ${function:Remove-CmsCredentialSecret} -ArgumentList $Target, $Prefix
+				Invoke-Command -ComputerName $CmsComputer -ScriptBlock {
+					. ([ScriptBlock]::Create($using:RemoveFunction))
+					Remove-CmsCredentialSecret @using:RemoveParameters
+				}
 			}
 			Catch {
 				Write-Host "ERROR: could not remove credentials on '$CmsComputer'"
@@ -684,7 +698,12 @@ Function Remove-CmsCredentials {
 		}
 	}
 	Else {
-		Remove-CmsCredentialSecret $Target $Prefix
+		Try {
+			Remove-CmsCredentialSecret @RemoveParameters
+		}
+		Catch {
+			Write-Host 'ERROR: could not remove credentials on local computer'
+		}
 	}
 }
 
@@ -699,11 +718,17 @@ Function Unprotect-CmsCredentials {
 	.PARAMETER Target
 	Specifies the identity of a CMS credential.
 
+	.PARAMETER PasswordOnly
+	Specifies the credential should be returned as a plain-text password. This changes the output to a PSCustomObject with Username and Password properties.
+
 	.PARAMETER Prefix
 	Specifies the prefix for the CMS credential file. Set to 'cms' by default.
 
-	.PARAMETER PasswordOnly
-	Specifies the credential should be returned as a plain-text password. This changes the output to a PSCustomObject with Username and Password properties.
+	.PARAMETER Hostname
+	Specifies the hostname in the CMS credential. Set to the local hostname by default.
+
+	.PARAMETER ParentPath
+	Specifies the parent path of the CMS credential folder. Set to the ProgramData folder by default.
 
 	.INPUTS
 	None.
@@ -730,17 +755,17 @@ Function Unprotect-CmsCredentials {
 		[Parameter(Position = 0, Mandatory = $True)]
 		[string]$Target,
 		[Parameter(Position = 1)]
-		[string]$Prefix = 'cms',
-		[Parameter(Position = 2)]
 		[switch]$PasswordOnly,
-		[Parameter(Position = 3, DontShow)]
+		[Parameter(Position = 2)]
+		[string]$Prefix = 'cms',
+		[Parameter(Position = 3)]
 		[string]$Hostname = [System.Environment]::MachineName.ToLowerInvariant(),
-		[Parameter(Position = 4, DontShow)]
-		[string]$Path = [System.Environment]::GetFolderPath('CommonApplicationData')
+		[Parameter(Position = 4)][ValidateScript({Test-Path -Path $_})]
+		[string]$ParentPath = [System.Environment]::GetFolderPath('CommonApplicationData')
 	)
 
 	# define required strings
-	$cms_path = Join-Path -Path $Path -ChildPath ($Prefix + '_' + $Hostname)
+	$cms_path = Join-Path -Path $ParentPath -ChildPath ($Prefix + '_' + $Hostname)
 
 	# verify cms folder
 	If (Test-Path -Path $cms_path) {
@@ -844,21 +869,37 @@ Function Grant-CmsCredentialAccess {
 
 	# get computer names
 	$CmsComputers = @()
-	$CmsComputers += Get-CmsComputers -Cluster:$Cluster -ClusterName $ClusterName -ComputerName $ComputerName
+	$CmsComputers += Get-ComputersFromParams -Cluster:$Cluster -ClusterName $ClusterName -ComputerName $ComputerName
+
+	# define parameter hashtable
+	$UpdateParameters = @{
+		Mode       = 'Grant'
+		Target     = $Target
+		Principals = $Principals
+	}
 
 	# encrypt credentials to certificate
 	If ($CmsComputers.Count -gt 0) {
+		$UpdateFunction = "function Update-CmsCredentialAccess {${function:Update-CmsCredentialAccess}}"
 		ForEach ($CmsComputer in $CmsComputers) {
-			Try {
-				Invoke-Command -ComputerName $CmsComputer -ScriptBlock ${function:Update-CmsCredentialAccess} -ArgumentList 'Grant', $Target, $Principals
-			}
-			Catch {
-				Write-Host "ERROR: could not grant credential access on '$CmsComputer'"
+			Invoke-Command -ComputerName $CmsComputer -ScriptBlock {
+				Try {
+					. ([ScriptBlock]::Create($using:UpdateFunction))
+					Update-CmsCredentialAccess @using:UpdateParameters
+				}
+				Catch {
+					Write-Host "ERROR: could not grant credential access on '$using:CmsComputer'"
+				}
 			}
 		}
 	}
 	Else {
-		Update-CmsCredentialAccess -Mode 'Grant' -Target $Target -Principals $Principals
+		Try {
+			Update-CmsCredentialAccess @UpdateParameters
+		}
+		Catch {
+			Write-Host 'ERROR: could not grant credential access on local computer'
+		}
 	}
 }
 
@@ -919,21 +960,36 @@ Function Reset-CmsCredentialAccess {
 
 	# get computer names
 	$CmsComputers = @()
-	$CmsComputers += Get-CmsComputers -Cluster:$Cluster -ClusterName $ClusterName -ComputerName $ComputerName
+	$CmsComputers += Get-ComputersFromParams -Cluster:$Cluster -ClusterName $ClusterName -ComputerName $ComputerName
+
+	# define parameter hashtable
+	$UpdateParameters = @{
+		Mode   = 'Reset'
+		Target = $Target
+	}
 
 	# encrypt credentials to certificate
 	If ($CmsComputers.Count -gt 0) {
+		$UpdateFunction = "function Update-CmsCredentialAccess {${function:Update-CmsCredentialAccess}}"
 		ForEach ($CmsComputer in $CmsComputers) {
-			Try {
-				Invoke-Command -ComputerName $CmsComputer -ScriptBlock ${function:Update-CmsCredentialAccess} -ArgumentList 'Reset', $Target
-			}
-			Catch {
-				Write-Host "ERROR: could not Reset credential access on '$CmsComputer'"
+			Invoke-Command -ComputerName $CmsComputer -ScriptBlock {
+				Try {
+					. ([ScriptBlock]::Create($using:UpdateFunction))
+					Update-CmsCredentialAccess @using:UpdateParameters
+				}
+				Catch {
+					Write-Host "ERROR: could not reset credential access on '$using:CmsComputer'"
+				}
 			}
 		}
 	}
 	Else {
-		Update-CmsCredentialAccess -Mode 'Reset' -Target $Target
+		Try {
+			Update-CmsCredentialAccess @UpdateParameters
+		}
+		Catch {
+			Write-Host 'ERROR: could not reset credential access on local computer'
+		}
 	}
 }
 
@@ -967,19 +1023,19 @@ Function Revoke-CmsCredentialAccess {
 	None.
 
 	.EXAMPLE
-	PS> Revoke-CmsCredentialAccess -Target "testcredential" -Principals "DOMAIN\User1","DOMAIN\User2"
+	PS> Revoke-CmsCredentialAccess -Target "testcredential" -Principals "DOMAIN\TestUser"
 
 	.EXAMPLE
-	PS> Revoke-CmsCredentialAccess -Target "testcredential" -Principals "DOMAIN\GroupA" -ComputerName "server1", "server2"
+	PS> Revoke-CmsCredentialAccess -Target "testcredential" -Principals "DOMAIN\TestUser" -ComputerName "server1", "server2"
 
 	.EXAMPLE
-	PS> Revoke-CmsCredentialAccess -Target "testcredential" -Principals "DOMAIN\User1","DOMAIN\GroupA" -ClusterName "cluster1", "cluster2"
+	PS> Revoke-CmsCredentialAccess -Target "testcredential" -Principals "DOMAIN\TestUser" -ClusterName "cluster1", "cluster2"
 
 	.EXAMPLE
-	PS> Revoke-CmsCredentialAccess -Target "testcredential" -Principals "DOMAIN\User1" -Cluster
+	PS> Revoke-CmsCredentialAccess -Target "testcredential" -Principals "DOMAIN\TestUser" -Cluster
 
 	.EXAMPLE
-	PS> Revoke-CmsCredentialAccess -Target "testcredential" -Principals "DOMAIN\GroupA","DOMAIN\User2" -ComputerName "server1", "server2" -ClusterName "cluster1", "cluster2" -Cluster
+	PS> Revoke-CmsCredentialAccess -Target "testcredential" -Principals "DOMAIN\TestUser" -ComputerName "server1", "server2" -ClusterName "cluster1", "cluster2" -Cluster
 
 	#>
 
@@ -999,32 +1055,51 @@ Function Revoke-CmsCredentialAccess {
 
 	# get computer names
 	$CmsComputers = @()
-	$CmsComputers += Get-CmsComputers -Cluster:$Cluster -ClusterName $ClusterName -ComputerName $ComputerName
+	$CmsComputers += Get-ComputersFromParams -Cluster:$Cluster -ClusterName $ClusterName -ComputerName $ComputerName
+
+	# define parameter hashtable
+	$UpdateParameters = @{
+		Mode       = 'Revoke'
+		Target     = $Target
+		Principals = $Principals
+	}
 
 	# encrypt credentials to certificate
 	If ($CmsComputers.Count -gt 0) {
+		$UpdateFunction = "function Update-CmsCredentialAccess {${function:Update-CmsCredentialAccess}}"
 		ForEach ($CmsComputer in $CmsComputers) {
-			Try {
-				Invoke-Command -ComputerName $CmsComputer -ScriptBlock ${function:Update-CmsCredentialAccess} -ArgumentList 'Revoke', $Target, $Principals
-			}
-			Catch {
-				Write-Host "ERROR: could not revoke credential access on '$CmsComputer'"
+			Invoke-Command -ComputerName $CmsComputer -ScriptBlock {
+				Try {
+					. ([ScriptBlock]::Create($using:UpdateFunction))
+					Update-CmsCredentialAccess @using:UpdateParameters
+				}
+				Catch {
+					Write-Host "ERROR: could not revoke credential access on '$using:CmsComputer'"
+				}
 			}
 		}
 	}
 	Else {
-		Update-CmsCredentialAccess -Mode 'Revoke' -Target $Target -Principals $Principals
+		Try {
+			Update-CmsCredentialAccess @UpdateParameters
+		}
+		Catch {
+			Write-Host 'ERROR: could not revoke credential access on local computer'
+		}
 	}
 }
 
 # define functions to export
 $functions_to_export = @()
+$functions_to_export += 'Protect-CmsCredentialSecret'
+$functions_to_export += 'Remove-CmsCredentialSecret'
 $functions_to_export += 'Protect-CmsCredentials'
 $functions_to_export += 'Remove-CmsCredentials'
 $functions_to_export += 'Unprotect-CmsCredentials'
 $functions_to_export += 'Grant-CmsCredentialAccess'
 $functions_to_export += 'Reset-CmsCredentialAccess'
 $functions_to_export += 'Revoke-CmsCredentialAccess'
+$functions_to_export += 'Update-CmsCredentialAccess'
 
 # export module members
 Export-ModuleMember -Function $functions_to_export -Variable $CmsTemplate
